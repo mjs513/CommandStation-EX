@@ -21,10 +21,11 @@
 #include <Arduino.h>
 #include "MotorDriver.h"
 #include "MotorDrivers.h"
+#include "FSH.h"
 
 typedef void (*ACK_CALLBACK)(int result);
 
-enum ackOp
+enum ackOp : byte
 {           // Program opcodes for the ack Manager
   BASELINE, // ensure enough resets sent before starting and obtain baseline current
   W0,
@@ -64,7 +65,8 @@ const byte MAX_LOCOS = 50;
 class DCC
 {
 public:
-  static void begin(const __FlashStringHelper *motorShieldName, MotorDriver *mainDriver, MotorDriver *progDriver, byte timerNumber = 1);
+  static void begin(const FSH * motorShieldName, MotorDriver *mainDriver, MotorDriver *progDriver,
+                    byte joinRelayPin=UNUSED_PIN);
   static void loop();
 
   // Public DCC API functions
@@ -84,22 +86,22 @@ public:
   static void setProgTrackBoost(bool on);    // when true, special prog track current limit does not apply
 
   // ACKable progtrack calls  bitresults callback 0,0 or -1, cv returns value or -1
-  static void readCV(int cv, ACK_CALLBACK callback, bool blocking = false);
-  static void readCVBit(int cv, byte bitNum, ACK_CALLBACK callback, bool blocking = false); // -1 for error
-  static void writeCVByte(int cv, byte byteValue, ACK_CALLBACK callback, bool blocking = false);
-  static void writeCVBit(int cv, byte bitNum, bool bitValue, ACK_CALLBACK callback, bool blocking = false);
-  static void verifyCVByte(int cv, byte byteValue, ACK_CALLBACK callback, bool blocking = false);
-  static void verifyCVBit(int cv, byte bitNum, bool bitValue, ACK_CALLBACK callback, bool blocking = false);
+  static void readCV(int cv, ACK_CALLBACK callback);
+  static void readCVBit(int cv, byte bitNum, ACK_CALLBACK callback); // -1 for error
+  static void writeCVByte(int cv, byte byteValue, ACK_CALLBACK callback);
+  static void writeCVBit(int cv, byte bitNum, bool bitValue, ACK_CALLBACK callback);
+  static void verifyCVByte(int cv, byte byteValue, ACK_CALLBACK callback);
+  static void verifyCVBit(int cv, byte bitNum, bool bitValue, ACK_CALLBACK callback);
 
-  static void getLocoId(ACK_CALLBACK callback, bool blocking = false);
-  static void setLocoId(int id,ACK_CALLBACK callback, bool blocking = false);
+  static void getLocoId(ACK_CALLBACK callback);
+  static void setLocoId(int id,ACK_CALLBACK callback);
 
   // Enhanced API functions
   static void forgetLoco(int cab); // removes any speed reminders for this loco
   static void forgetAllLocos();    // removes all speed reminders
   static void displayCabList(Print *stream);
 
-  static __FlashStringHelper *getMotorShieldName();
+  static FSH *getMotorShieldName();
 
 private:
   struct LOCO
@@ -109,13 +111,14 @@ private:
     byte groupFlags;
     unsigned long functions;
   };
+  static byte joinRelay;
   static byte loopStatus;
   static void setThrottle2(uint16_t cab, uint8_t speedCode);
   static void updateLocoReminder(int loco, byte speedCode);
   static void setFunctionInternal(int cab, byte fByte, byte eByte);
   static bool issueReminder(int reg);
   static int nextLoco;
-  static __FlashStringHelper *shieldName;
+  static FSH *shieldName;
 
   static LOCO speedTable[MAX_LOCOS];
   static byte cv1(byte opcode, int cv);
@@ -133,10 +136,10 @@ private:
   static byte ackManagerStash;
   static bool ackReceived;
   static ACK_CALLBACK ackManagerCallback;
-  static void ackManagerSetup(int cv, byte bitNumOrbyteValue, ackOp const program[], ACK_CALLBACK callback, bool blocking);
-  static void ackManagerSetup(int wordval, ackOp const program[], ACK_CALLBACK callback, bool blocking);
-  static void ackManagerLoop(bool blocking);
-  static bool checkResets(bool blocking, uint8_t numResets);
+  static void ackManagerSetup(int cv, byte bitNumOrbyteValue, ackOp const program[], ACK_CALLBACK callback);
+  static void ackManagerSetup(int wordval, ackOp const program[], ACK_CALLBACK callback);
+  static void ackManagerLoop();
+  static bool checkResets( uint8_t numResets);
   static const int PROG_REPEATS = 8; // repeats of programming commands (some decoders need at least 8 to be reliable)
 
   // NMRA codes #
@@ -162,6 +165,8 @@ private:
 #define ARDUINO_TYPE "NANO"
 #elif defined(ARDUINO_AVR_MEGA2560)
 #define ARDUINO_TYPE "MEGA"
+#elif defined(ARDUINO_ARCH_MEGAAVR)
+#define ARDUINO_TYPE "MEGAAVR"
 #else
 #error CANNOT COMPILE - DCC++ EX ONLY WORKS WITH AN ARDUINO UNO, NANO 328, OR ARDUINO MEGA 1280/2560
 #endif

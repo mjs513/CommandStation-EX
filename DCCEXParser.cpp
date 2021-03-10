@@ -52,10 +52,12 @@ const int HASH_KEYWORD_ETHERNET = -30767;
 const int HASH_KEYWORD_MAX = 16244;
 const int HASH_KEYWORD_MIN = 15978;
 
-int DCCEXParser::stashP[MAX_PARAMS];
+int DCCEXParser::stashP[MAX_COMMAND_PARAMS];
 bool DCCEXParser::stashBusy;
 
 Print *DCCEXParser::stashStream = NULL;
+RingStream *DCCEXParser::stashRingStream = NULL;
+byte DCCEXParser::stashTarget=0;
 
 // This is a JMRI command parser, one instance per incoming stream
 // It doesnt know how the string got here, nor how it gets back.
@@ -90,7 +92,7 @@ void DCCEXParser::loop(Stream &stream)
         else if (ch == '>')
         {
             buffer[bufferLength] = '\0';
-            parse(&stream, buffer, false); // Parse this allowing async responses
+            parse(&stream, buffer, NULL); // Parse this (No ringStream for serial)
             inCommandPayload = false;
             break;
         }
@@ -102,7 +104,7 @@ void DCCEXParser::loop(Stream &stream)
     Sensor::checkAll(&stream); // Update and print changes
 }
 
-int DCCEXParser::splitValues(int result[MAX_PARAMS], const byte *cmd)
+int DCCEXParser::splitValues(int result[MAX_COMMAND_PARAMS], const byte *cmd)
 {
     byte state = 1;
     byte parameterCount = 0;
@@ -111,10 +113,10 @@ int DCCEXParser::splitValues(int result[MAX_PARAMS], const byte *cmd)
     bool signNegative = false;
 
     // clear all parameters in case not enough found
-    for (int i = 0; i < MAX_PARAMS; i++)
+    for (int i = 0; i < MAX_COMMAND_PARAMS; i++)
         result[i] = 0;
 
-    while (parameterCount < MAX_PARAMS)
+    while (parameterCount < MAX_COMMAND_PARAMS)
     {
         byte hot = *remainingCmd;
 
@@ -143,6 +145,7 @@ int DCCEXParser::splitValues(int result[MAX_PARAMS], const byte *cmd)
                 runningValue = 10 * runningValue + (hot - '0');
                 break;
             }
+            if (hot >= 'a' && hot <= 'z') hot=hot-'a'+'A'; // uppercase a..z
             if (hot >= 'A' && hot <= 'Z')
             {
                 // Since JMRI got modified to send keywords in some rare cases, we need this
@@ -160,7 +163,7 @@ int DCCEXParser::splitValues(int result[MAX_PARAMS], const byte *cmd)
     return parameterCount;
 }
 
-int DCCEXParser::splitHexValues(int result[MAX_PARAMS], const byte *cmd)
+int DCCEXParser::splitHexValues(int result[MAX_COMMAND_PARAMS], const byte *cmd)
 {
     byte state = 1;
     byte parameterCount = 0;
@@ -168,10 +171,10 @@ int DCCEXParser::splitHexValues(int result[MAX_PARAMS], const byte *cmd)
     const byte *remainingCmd = cmd + 1; // skips the opcode
     
     // clear all parameters in case not enough found
-    for (int i = 0; i < MAX_PARAMS; i++)
+    for (int i = 0; i < MAX_COMMAND_PARAMS; i++)
         result[i] = 0;
 
-    while (parameterCount < MAX_PARAMS)
+    while (parameterCount < MAX_COMMAND_PARAMS)
     {
         byte hot = *remainingCmd;
 
@@ -237,20 +240,20 @@ void DCCEXParser::setAtCommandCallback(AT_COMMAND_CALLBACK callback)
 }
 
 // Parse an F() string 
-void DCCEXParser::parse(const __FlashStringHelper * cmd) {
+void DCCEXParser::parse(const FSH * cmd) {
       int size=strlen_P((char *)cmd)+1; 
       char buffer[size];
       strcpy_P(buffer,(char *)cmd);
-      parse(&Serial,(byte *)buffer,true);
+      parse(&Serial,(byte *)buffer,NULL);
 }
 
 // See documentation on DCC class for info on this section
-void DCCEXParser::parse(Print *stream, byte *com, bool blocking)
+void DCCEXParser::parse(Print *stream, byte *com, RingStream * ringStream)
 {
     (void)EEPROM; // tell compiler not to warn this is unused
     if (Diag::CMD)
         DIAG(F("\nPARSING:%s\n"), com);
-    int p[MAX_PARAMS];
+    int p[MAX_COMMAND_PARAMS];
     while (com[0] == '<' || com[0] == ' ')
         com++; // strip off any number of < or spaces
     byte params = splitValues(p, com);
@@ -314,12 +317,33 @@ void DCCEXParser::parse(Print *stream, byte *com, bool blocking)
             return;
         break;
 
-    case 'a': // ACCESSORY <a ADDRESS SUBADDRESS ACTIVATE>
-        if (p[2] != (p[2] & 1))
-            return;
-        DCC::setAccessory(p[0], p[1], p[2] == 1);
+    case 'a': // ACCESSORY <a ADDRESS SUBADDRESS ACTIVATE> or <a LINEARADDRESS ACTIVATE>
+        { 
+          int address;
+          byte subaddress;
+          byte activep;
+          if (params==2) { // <a LINEARADDRESS ACTIVATE>
+              address=(p[0] - 1) / 4 + 1;
+              subaddress=(p[0] - 1)  % 4;
+              activep=1;        
+          }
+          else if (params==3) { // <a ADDRESS SUBADDRESS ACTIVATE>
+              address=p[0];
+              subaddress=p[1];
+              activep=2;        
+          }
+          else break; // invalid no of parameters
+          
+          if (
+             ((address & 0x01FF) != address)      // invalid address (limit 9 bits ) 
+          || ((subaddress & 0x03) != subaddress)  // invalid subaddress (limit 2 bits ) 
+          || ((p[activep]  & 0x01) != p[activep]) // invalid activate 0|1
+          ) break; 
+            
+          DCC::setAccessory(address, subaddress,p[activep]==1);
+        }
         return;
-
+     
     case 'T': // TURNOUT  <T ...>
         if (parseT(stream, params, p))
             return;
@@ -359,50 +383,50 @@ void DCCEXParser::parse(Print *stream, byte *com, bool blocking)
         return;
         
     case 'W': // WRITE CV ON PROG <W CV VALUE CALLBACKNUM CALLBACKSUB>
-            if (!stashCallback(stream, p))
+            if (!stashCallback(stream, p, ringStream))
                 break;
         if (params == 1) // <W id> Write new loco id (clearing consist and managing short/long)
-            DCC::setLocoId(p[0],callback_Wloco, blocking);
+            DCC::setLocoId(p[0],callback_Wloco);
         else // WRITE CV ON PROG <W CV VALUE [CALLBACKNUM] [CALLBACKSUB]>
-            DCC::writeCVByte(p[0], p[1], callback_W, blocking);
+            DCC::writeCVByte(p[0], p[1], callback_W);
         return;
 
     case 'V': // VERIFY CV ON PROG <V CV VALUE> <V CV BIT 0|1>
         if (params == 2)
         { // <V CV VALUE>
-            if (!stashCallback(stream, p))
+            if (!stashCallback(stream, p, ringStream))
                 break;
-            DCC::verifyCVByte(p[0], p[1], callback_Vbyte, blocking);
+            DCC::verifyCVByte(p[0], p[1], callback_Vbyte);
             return;
         }
         if (params == 3)
         {
-            if (!stashCallback(stream, p))
+            if (!stashCallback(stream, p, ringStream))
                 break;
-            DCC::verifyCVBit(p[0], p[1], p[2], callback_Vbit, blocking);
+            DCC::verifyCVBit(p[0], p[1], p[2], callback_Vbit);
             return;
         }
         break;
 
     case 'B': // WRITE CV BIT ON PROG <B CV BIT VALUE CALLBACKNUM CALLBACKSUB>
-        if (!stashCallback(stream, p))
+        if (!stashCallback(stream, p, ringStream))
             break;
-        DCC::writeCVBit(p[0], p[1], p[2], callback_B, blocking);
+        DCC::writeCVBit(p[0], p[1], p[2], callback_B);
         return;
 
     case 'R': // READ CV ON PROG
         if (params == 3)
         { // <R CV CALLBACKNUM CALLBACKSUB>
-            if (!stashCallback(stream, p))
+            if (!stashCallback(stream, p, ringStream))
                 break;
-            DCC::readCV(p[0], callback_R, blocking);
+            DCC::readCV(p[0], callback_R);
             return;
         }
         if (params == 0)
         { // <R> New read loco id
-            if (!stashCallback(stream, p))
+            if (!stashCallback(stream, p, ringStream))
                 break;
-            DCC::getLocoId(callback_Rloco, blocking);
+            DCC::getLocoId(callback_Rloco);
             return;
         }
         break;
@@ -414,7 +438,8 @@ void DCCEXParser::parse(Print *stream, byte *com, bool blocking)
         {
             POWERMODE mode = opcode == '1' ? POWERMODE::ON : POWERMODE::OFF;
             DCC::setProgTrackSyncMain(false); // Only <1 JOIN> will set this on, all others set it off
-            if (params == 0)
+            if (params == 0 ||
+		(MotorDriver::commonFaultPin && p[0] != HASH_KEYWORD_JOIN)) // commonFaultPin prevents individual track handling
             {
                 DCCWaveform::mainTrack.setPowerMode(mode);
                 DCCWaveform::progTrack.setPowerMode(mode);
@@ -732,10 +757,6 @@ bool DCCEXParser::parseD(Print *stream, int params, int p[])
         Diag::WITHROTTLE = onOff;
         return true;
 
-    case HASH_KEYWORD_DCC:
-        DCCWaveform::setDiagnosticSlowWave(params >= 1 && p[1] == HASH_KEYWORD_SLOW);
-        return true;
-
     case HASH_KEYWORD_PROGBOOST:
         DCC::setProgTrackBoost(true);
 	return true;
@@ -752,52 +773,70 @@ bool DCCEXParser::parseD(Print *stream, int params, int p[])
 }
 
 // CALLBACKS must be static
-bool DCCEXParser::stashCallback(Print *stream, int p[MAX_PARAMS])
+bool DCCEXParser::stashCallback(Print *stream, int p[MAX_COMMAND_PARAMS], RingStream * ringStream)
 {
     if (stashBusy )
         return false;
     stashBusy = true;
     stashStream = stream;
-    memcpy(stashP, p, MAX_PARAMS * sizeof(p[0]));
+    stashRingStream=ringStream;
+    if (ringStream) stashTarget= ringStream->peekTargetMark();
+    memcpy(stashP, p, MAX_COMMAND_PARAMS * sizeof(p[0]));
     return true;
 }
+
+Print * DCCEXParser::getAsyncReplyStream() {
+       if (stashRingStream) {
+           stashRingStream->mark(stashTarget);
+           return stashRingStream;
+       }
+       return stashStream;
+}
+
+void DCCEXParser::commitAsyncReplyStream() {
+     if (stashRingStream) stashRingStream->commit();
+     stashBusy = false;
+}
+
 void DCCEXParser::callback_W(int result)
 {
-    StringFormatter::send(stashStream, F("<r%d|%d|%d %d>"), stashP[2], stashP[3], stashP[0], result == 1 ? stashP[1] : -1);
-    stashBusy = false;
+    StringFormatter::send(getAsyncReplyStream(),
+          F("<r%d|%d|%d %d>"), stashP[2], stashP[3], stashP[0], result == 1 ? stashP[1] : -1);
+    commitAsyncReplyStream();
 }
 
 void DCCEXParser::callback_B(int result)
 {
-    StringFormatter::send(stashStream, F("<r%d|%d|%d %d %d>"), stashP[3], stashP[4], stashP[0], stashP[1], result == 1 ? stashP[2] : -1);
-    stashBusy = false;
+    StringFormatter::send(getAsyncReplyStream(), 
+          F("<r%d|%d|%d %d %d>"), stashP[3], stashP[4], stashP[0], stashP[1], result == 1 ? stashP[2] : -1);
+    commitAsyncReplyStream();
 }
 void DCCEXParser::callback_Vbit(int result)
 {
-    StringFormatter::send(stashStream, F("<v %d %d %d>"), stashP[0], stashP[1], result);
-    stashBusy = false;
+    StringFormatter::send(getAsyncReplyStream(), F("<v %d %d %d>"), stashP[0], stashP[1], result);
+    commitAsyncReplyStream();
 }
 void DCCEXParser::callback_Vbyte(int result)
 {
-    StringFormatter::send(stashStream, F("<v %d %d>"), stashP[0], result);
-    stashBusy = false;
+    StringFormatter::send(getAsyncReplyStream(), F("<v %d %d>"), stashP[0], result);
+    commitAsyncReplyStream();
 }
 
 void DCCEXParser::callback_R(int result)
 {
-    StringFormatter::send(stashStream, F("<r%d|%d|%d %d>"), stashP[1], stashP[2], stashP[0], result);
-    stashBusy = false;
+    StringFormatter::send(getAsyncReplyStream(), F("<r%d|%d|%d %d>"), stashP[1], stashP[2], stashP[0], result);
+    commitAsyncReplyStream();
 }
 
 void DCCEXParser::callback_Rloco(int result)
 {
-    StringFormatter::send(stashStream, F("<r %d>"), result & 0x3FFF);
-    stashBusy = false;
+    StringFormatter::send(getAsyncReplyStream(), F("<r %d>"), result);
+    commitAsyncReplyStream();
 }
 
 void DCCEXParser::callback_Wloco(int result)
 {
     if (result==1) result=stashP[0]; // pick up original requested id from command
-    StringFormatter::send(stashStream, F("<w %d>"), result);
-    stashBusy = false;
+    StringFormatter::send(getAsyncReplyStream(), F("<w %d>"), result);
+    commitAsyncReplyStream();
 }
